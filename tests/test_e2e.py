@@ -400,3 +400,196 @@ def test_path_traversal_rejected(proxy):
     with client() as c:
         r = c.get(f"{proxy.url}/packages/..%2f..%2fetc%2fpasswd")
     assert r.status_code in (400, 404)
+
+
+# --------------------------------------------------------------------- #
+# per-build billing                                                     #
+# --------------------------------------------------------------------- #
+
+def download_with_build(base: str, path: str, build_id: str,
+                        timeout_read: float = 120.0) -> httpx.Response:
+    with client(timeout_read=timeout_read) as c:
+        r = c.get(f"{base}/packages/{path}", headers={"X-Build-ID": build_id})
+        r.raise_for_status()
+        return r
+
+
+def settle(proxy_url: str, build_id: str) -> httpx.Response:
+    with client() as c:
+        return c.post(f"{proxy_url}/billing/settle/{build_id}")
+
+
+def settle_until_final(proxy_url: str, build_id: str, timeout: float = 15.0) -> dict:
+    """Settle, tolerating 202-processing responses until the bill is final."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        r = settle(proxy_url, build_id)
+        if r.status_code == 200:
+            return r.json()
+        assert r.status_code == 202, f"unexpected settle response: {r.status_code}"
+        last = r.json()
+        assert last["status"] == "processing"
+        time.sleep(0.2)
+    raise AssertionError(f"settlement for {build_id} never finalized: {last}")
+
+
+def test_billing_untagged_downloads_are_not_billed(proxy, origin):
+    origin_reset(origin.url)
+    body = download_bytes(proxy.url, PKG_SMALL)
+    assert len(body) == MIB
+    with client() as c:
+        assert c.get(f"{proxy.url}/billing/builds").json() == {}
+        assert c.get(f"{proxy.url}/billing/builds/never-existed").status_code == 404
+
+
+def test_billing_miss_and_hit_accounting_then_frozen_bill(proxy, origin):
+    origin_reset(origin.url)
+    r1 = download_with_build(proxy.url, PKG_SMALL, "build-x")  # MISS: fill billed
+    assert r1.headers["x-cache"] == "MISS"
+    r2 = download_with_build(proxy.url, PKG_SMALL, "build-x")  # HIT: downstream only
+    assert r2.headers["x-cache"] == "HIT"
+
+    # Untagged traffic is served but never billed.
+    download_bytes(proxy.url, PKG_SMALL)
+    with client() as c:
+        builds = c.get(f"{proxy.url}/billing/builds").json()
+    assert list(builds) == ["build-x"]
+
+    bill = settle_until_final(proxy.url, "build-x")
+    assert bill["status"] == "final"
+    assert bill["packages"][PKG_SMALL] == {
+        "downstream_bytes": 2 * MIB,  # one MISS + one HIT download
+        "origin_bytes": MIB,          # only the MISS pulled from the origin
+    }
+    assert bill["totals"] == {"downstream_bytes": 2 * MIB, "origin_bytes": MIB}
+
+    # Every later call returns the identical bill.
+    assert settle(proxy.url, "build-x").json() == bill
+
+    # Sealed: new tagged downloads are rejected, untagged still served.
+    with client() as c:
+        rj = c.get(f"{proxy.url}/packages/{PKG_SMALL}", headers={"X-Build-ID": "build-x"})
+        assert rj.status_code == 409
+        ru = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+        assert ru.status_code == 200 and len(ru.content) == MIB
+
+
+def test_billing_settle_processing_then_final_and_sealed(proxy, origin):
+    set_behavior(origin.url, delay_ms=60, chunk_size=64 * 1024)  # ~1s fill
+    try:
+        origin_reset(origin.url)
+        result: dict = {}
+
+        def reader():
+            result["body"] = download_with_build(proxy.url, PKG_SMALL, "build-slow").content
+
+        t = threading.Thread(target=reader)
+        t.start()
+        time.sleep(0.3)  # download accepted, streaming in progress
+
+        r1 = settle(proxy.url, "build-slow")
+        assert r1.status_code == 202
+        assert r1.json()["status"] == "processing"
+        assert r1.json()["downloads_in_flight"] >= 1
+
+        # First settle sealed the build even while processing.
+        with client() as c:
+            rj = c.get(
+                f"{proxy.url}/packages/{PKG_SMALL}", headers={"X-Build-ID": "build-slow"}
+            )
+            assert rj.status_code == 409
+            # Untagged downloads are unaffected by the seal.
+            ru = c.get(f"{proxy.url}/packages/{PKG_SMALL}")
+            assert ru.status_code == 200 and len(ru.content) == MIB
+
+        t.join(30)
+        assert len(result["body"]) == MIB
+
+        bill = settle_until_final(proxy.url, "build-slow")
+        assert bill["packages"][PKG_SMALL]["downstream_bytes"] == MIB
+        assert bill["packages"][PKG_SMALL]["origin_bytes"] == MIB
+        assert settle(proxy.url, "build-slow").json() == bill
+    finally:
+        set_behavior(origin.url)
+
+
+def test_billing_shared_fill_initiator_disconnects_midway(proxy, origin):
+    """The required scenario: a shared origin fill billed to the initiating
+    build, whose own download disconnects midway through the fill."""
+    set_behavior(origin.url, delay_ms=100, chunk_size=64 * 1024)  # ~1.6s fill
+    try:
+        origin_reset(origin.url)
+        result: dict = {}
+
+        def initiator():
+            with client(timeout_read=60) as c:
+                with c.stream(
+                    "GET",
+                    f"{proxy.url}/packages/{PKG_SMALL}",
+                    headers={"X-Build-ID": "build-init"},
+                ) as r:
+                    got = 0
+                    for chunk in r.iter_bytes(64 * 1024):
+                        got += len(chunk)
+                        if got >= 3 * 64 * 1024:
+                            break  # disconnect after ~3 chunks
+                    result["init_got"] = got
+
+        def follower():
+            # Attaches to the same in-flight fill and reads it to the end.
+            result["follower"] = download_with_build(
+                proxy.url, PKG_SMALL, "build-follow"
+            ).content
+
+        ta = threading.Thread(target=initiator)
+        tb = threading.Thread(target=follower)
+        ta.start()
+        time.sleep(0.15)  # build-init opens the fill first
+        tb.start()
+        ta.join(30)  # initiator disconnects after ~3 chunks, fill keeps going
+
+        assert result["init_got"] >= 3 * 64 * 1024
+
+        # The initiator is gone but its fill is still running: processing.
+        r1 = settle(proxy.url, "build-init")
+        assert r1.status_code == 202
+        assert r1.json()["status"] == "processing"
+        assert r1.json()["fills_in_flight"] == 1
+
+        tb.join(30)
+        assert len(result["follower"]) == MIB
+        assert origin_stats(origin.url)["total_hits"] == 1  # one shared fill
+
+        bill_a = settle_until_final(proxy.url, "build-init")
+        pa = bill_a["packages"][PKG_SMALL]
+        # The whole shared fill is billed to the initiating build, including
+        # the bytes the origin sent after the initiator disconnected.
+        assert pa["origin_bytes"] == MIB
+        # Its own downstream stopped where the connection broke.
+        assert 3 * 64 * 1024 <= pa["downstream_bytes"] < MIB
+
+        bill_b = settle_until_final(proxy.url, "build-follow")
+        pb = bill_b["packages"][PKG_SMALL]
+        # The follower pays only its own downstream, no origin bytes.
+        assert pb["origin_bytes"] == 0
+        assert pb["downstream_bytes"] == MIB
+    finally:
+        set_behavior(origin.url)
+
+
+def test_billing_failed_fill_still_counts_bytes(proxy, origin):
+    """Origin aborts mid-body: bytes read/delivered before the break count."""
+    set_behavior(origin.url, delay_ms=30, chunk_size=64 * 1024, truncate=200_000)
+    try:
+        origin_reset(origin.url)
+        with pytest.raises(httpx.HTTPError):
+            download_with_build(proxy.url, PKG_SMALL, "build-fail")
+
+        bill = settle_until_final(proxy.url, "build-fail")
+        p = bill["packages"][PKG_SMALL]
+        assert p["origin_bytes"] == 200_000  # exactly what the proxy read
+        assert 0 < p["downstream_bytes"] <= 200_000  # delivered before failing
+        assert p["downstream_bytes"] < MIB
+    finally:
+        set_behavior(origin.url)

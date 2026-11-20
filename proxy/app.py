@@ -16,6 +16,13 @@ Design notes
 * Origin failure fails every attached download and never leaves a cached
   half-package. Startup deletes leftover ``.part-*`` files and keeps complete
   packages.
+* Per-build billing: downloads tagged with ``X-Build-ID`` accrue downstream
+  body bytes (handed to the HTTP server) per package path; a fill's origin
+  body bytes are billed per path to the build whose request initiated that
+  fill. ``POST /billing/settle/{build_id}`` seals the build (new tagged
+  downloads get 409), reports "processing" while its downloads or fills are
+  still in flight, and freezes a final bill once all have finished. Bills
+  are kept in this process only.
 """
 
 from __future__ import annotations
@@ -30,8 +37,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, Header
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 ORIGIN_BASE_URL = os.environ.get("ORIGIN_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache")).resolve()
@@ -62,6 +69,128 @@ def _unlink_quiet(path: Path) -> None:
 
 class FillFailed(Exception):
     """Raised inside a client stream when the origin fill failed."""
+
+
+# --------------------------------------------------------------------- #
+# per-build billing                                                     #
+# --------------------------------------------------------------------- #
+
+MAX_BUILD_ID_LEN = 128
+
+
+class BuildState:
+    """Live counters for one build; the bill is frozen on final settlement."""
+
+    def __init__(self) -> None:
+        self.sealed = False            # settlement requested: reject new downloads
+        self.downloads_in_flight = 0   # accepted downloads not finished yet
+        self.fills_in_flight = 0       # origin fills initiated by this build
+        self.downstream: dict[str, int] = {}  # path -> body bytes handed to clients
+        self.origin: dict[str, int] = {}      # path -> body bytes read from origin
+        self.bill: dict | None = None         # frozen bill once finalized
+
+    def snapshot(self) -> dict:
+        return {
+            "sealed": self.sealed,
+            "finalized": self.bill is not None,
+            "downloads_in_flight": self.downloads_in_flight,
+            "fills_in_flight": self.fills_in_flight,
+            "downstream_bytes": dict(self.downstream),
+            "origin_bytes": dict(self.origin),
+        }
+
+
+class Billing:
+    """In-process per-build traffic accounting.
+
+    * downstream: package body bytes the proxy hands to the HTTP server for
+      a download tagged with X-Build-ID. Bytes already handed over count even
+      if the transfer breaks midway.
+    * origin: package body bytes the proxy actually reads from the origin.
+      A shared fill is billed only to the build whose request initiated it;
+      requests that attach later accrue only their own downstream bytes.
+    * Untagged downloads are served normally and never billed.
+    """
+
+    def __init__(self) -> None:
+        self.builds: dict[str, BuildState] = {}
+
+    def _state(self, build_id: str) -> BuildState:
+        st = self.builds.get(build_id)
+        if st is None:
+            st = BuildState()
+            self.builds[build_id] = st
+        return st
+
+    # ---- download path (all sync: atomicity comes from the event loop) ---- #
+
+    def try_begin_download(self, build_id: str) -> bool:
+        """Admit a tagged download unless the build is sealed for settlement."""
+        st = self._state(build_id)
+        if st.sealed:
+            return False
+        st.downloads_in_flight += 1
+        return True
+
+    def end_download(self, build_id: str) -> None:
+        self.builds[build_id].downloads_in_flight -= 1
+
+    def add_downstream(self, build_id: str, key: str, n: int) -> None:
+        st = self.builds[build_id]
+        st.downstream[key] = st.downstream.get(key, 0) + n
+
+    # ---- origin fill path ------------------------------------------------- #
+
+    def begin_fill(self, build_id: str | None) -> None:
+        if build_id is not None:
+            self._state(build_id).fills_in_flight += 1
+
+    def end_fill(self, build_id: str | None) -> None:
+        if build_id is not None:
+            self.builds[build_id].fills_in_flight -= 1
+
+    def add_origin(self, build_id: str | None, key: str, n: int) -> None:
+        if build_id is not None:
+            st = self.builds[build_id]
+            st.origin[key] = st.origin.get(key, 0) + n
+
+    # ---- settlement -------------------------------------------------------- #
+
+    def settle(self, build_id: str) -> tuple[dict | None, BuildState]:
+        """Seal the build. Returns (bill, state); bill is None while downloads
+        or fills initiated by this build are still in flight. Once finalized
+        the same frozen bill object is returned on every call."""
+        st = self._state(build_id)
+        st.sealed = True
+        if st.bill is not None:
+            return st.bill, st
+        if st.downloads_in_flight > 0 or st.fills_in_flight > 0:
+            return None, st
+        st.bill = self._freeze(build_id, st)
+        return st.bill, st
+
+    @staticmethod
+    def _freeze(build_id: str, st: BuildState) -> dict:
+        paths = sorted(set(st.downstream) | set(st.origin))
+        packages = {
+            p: {
+                "downstream_bytes": st.downstream.get(p, 0),
+                "origin_bytes": st.origin.get(p, 0),
+            }
+            for p in paths
+        }
+        return {
+            "build_id": build_id,
+            "status": "final",
+            "packages": packages,
+            "totals": {
+                "downstream_bytes": sum(st.downstream.values()),
+                "origin_bytes": sum(st.origin.values()),
+            },
+        }
+
+
+billing = Billing()
 
 
 class Entry:
@@ -144,8 +273,12 @@ class Cache:
         self.entries[key] = e
         return e
 
-    async def attach(self, key: str) -> Entry:
-        """Return the current generation for key, starting a fill if needed."""
+    async def attach(self, key: str, owner_build: str | None = None) -> Entry:
+        """Return the current generation for key, starting a fill if needed.
+
+        A newly started fill is initiated by owner_build: every origin body
+        byte it reads is billed to that build (None = untagged, not billed).
+        """
         async with self.lock:
             e = self.entries.get(key)
             if e is None:
@@ -153,7 +286,8 @@ class Cache:
             if e is None:
                 e = Entry(key)
                 self.entries[key] = e
-                e.fill_task = asyncio.create_task(self._fill(e))
+                billing.begin_fill(owner_build)
+                e.fill_task = asyncio.create_task(self._fill_tracked(e, owner_build))
             e.readers += 1
             return e
 
@@ -200,7 +334,15 @@ class Cache:
     # origin fill                                                         #
     # ------------------------------------------------------------------ #
 
-    async def _fill(self, e: Entry) -> None:
+    async def _fill_tracked(self, e: Entry, owner_build: str | None) -> None:
+        """Run the fill; the initiating build's fill slot is released on any
+        outcome (complete, closed, failed), so settlement can finalize."""
+        try:
+            await self._fill(e, owner_build)
+        finally:
+            billing.end_fill(owner_build)
+
+    async def _fill(self, e: Entry, owner_build: str | None = None) -> None:
         assert self.session is not None
         url = f"{ORIGIN_BASE_URL}/packages/{e.key}"
         try:
@@ -231,6 +373,10 @@ class Cache:
                         await asyncio.to_thread(f.flush)
                         written += len(chunk)
                         e.written = written
+                        # Bill origin body bytes to the initiating build as
+                        # they are read; bytes read before any later failure
+                        # or disconnect still count.
+                        billing.add_origin(owner_build, e.key, len(chunk))
                         async with e.cond:
                             e.cond.notify_all()
                 finally:
@@ -352,33 +498,72 @@ async def healthz():
 
 
 @app.get("/packages/{path:path}")
-async def get_package(path: str):
-    """Download a complete package by path (streamed from byte 0)."""
+async def get_package(path: str, x_build_id: str | None = Header(default=None)):
+    """Download a complete package by path (streamed from byte 0).
+
+    Tag the request with X-Build-ID to bill its traffic to that build:
+    downstream body bytes are charged to the build, and if this request
+    initiates the origin fill, the fill's origin bytes are charged too.
+    Untagged requests download normally and are not billed.
+    """
     try:
         key = validate_key(path)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
 
-    entry = await cache.attach(key)
-    hit = entry.state == "complete"
+    build_id = (x_build_id or "").strip() or None
+    if build_id is not None and len(build_id) > MAX_BUILD_ID_LEN:
+        return PlainTextResponse("X-Build-ID too long", status_code=400)
+
+    tagged = build_id is not None
+    if tagged and not billing.try_begin_download(build_id):
+        return PlainTextResponse(
+            f"build {build_id!r} is sealed for settlement; "
+            "new downloads with this build id are rejected",
+            status_code=409,
+        )
+
     try:
-        if not entry.headers_known:
-            async with entry.cond:
-                await entry.cond.wait_for(
-                    lambda: entry.headers_known or entry.state == "failed"
-                )
-    except asyncio.CancelledError:
-        await cache.detach(entry)
+        entry = await cache.attach(key, owner_build=build_id)
+        hit = entry.state == "complete"
+        try:
+            if not entry.headers_known:
+                async with entry.cond:
+                    await entry.cond.wait_for(
+                        lambda: entry.headers_known or entry.state == "failed"
+                    )
+        except asyncio.CancelledError:
+            await cache.detach(entry)
+            raise
+
+        if entry.state == "failed":
+            await cache.detach(entry)
+            if tagged:
+                billing.end_download(build_id)
+            status = (
+                entry.origin_status
+                if entry.origin_status and entry.origin_status != 200
+                else 502
+            )
+            return PlainTextResponse(
+                f"origin fetch failed: {entry.error}", status_code=status
+            )
+    except BaseException:
+        if tagged:
+            billing.end_download(build_id)
         raise
 
-    if entry.state == "failed":
-        await cache.detach(entry)
-        status = (
-            entry.origin_status
-            if entry.origin_status and entry.origin_status != 200
-            else 502
-        )
-        return PlainTextResponse(f"origin fetch failed: {entry.error}", status_code=status)
+    async def body():
+        try:
+            async for chunk in cache.stream(entry):
+                if tagged:
+                    # Handed to the HTTP server: counts even if the client
+                    # disconnects right after this chunk.
+                    billing.add_downstream(build_id, key, len(chunk))
+                yield chunk
+        finally:
+            if tagged:
+                billing.end_download(build_id)
 
     headers = {"X-Cache": "HIT" if hit else "MISS"}
     if entry.size >= 0:
@@ -387,7 +572,7 @@ async def get_package(path: str):
     if sha256:
         headers["X-Package-Sha256"] = sha256
     return StreamingResponse(
-        cache.stream(entry),
+        body(),
         media_type=entry.meta.get("content_type", "application/octet-stream"),
         headers=headers,
     )
@@ -409,3 +594,50 @@ async def purge_package(path: str):
 async def cache_status():
     async with cache.lock:
         return {k: e.info() for k, e in cache.entries.items()}
+
+
+# --------------------------------------------------------------------- #
+# billing API                                                           #
+# --------------------------------------------------------------------- #
+
+
+@app.post("/billing/settle/{build_id}")
+async def settle_build(build_id: str):
+    """Settle one build's traffic bill.
+
+    The first call seals the build: new downloads tagged with this build id
+    are rejected (409). While the build still has accepted downloads in
+    flight or origin fills it initiated unfinished, the call returns
+    "processing" (202). Once everything has finished, the bill is frozen and
+    every later call returns the identical bill. Bills live in this process.
+    """
+    bill, st = billing.settle(build_id)
+    if bill is None:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "build_id": build_id,
+                "status": "processing",
+                "downloads_in_flight": st.downloads_in_flight,
+                "fills_in_flight": st.fills_in_flight,
+            },
+        )
+    return bill
+
+
+@app.get("/billing/builds")
+async def list_builds():
+    """Live (non-mutating) view of all known builds and their counters."""
+    return {bid: st.snapshot() for bid, st in billing.builds.items()}
+
+
+@app.get("/billing/builds/{build_id}")
+async def get_build(build_id: str):
+    """Live counters for one build; includes the frozen bill if finalized."""
+    st = billing.builds.get(build_id)
+    if st is None:
+        return PlainTextResponse("unknown build id", status_code=404)
+    snap = st.snapshot()
+    if st.bill is not None:
+        snap["bill"] = st.bill
+    return snap
